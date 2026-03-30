@@ -1,5 +1,4 @@
 #include <ESP32Servo.h>
-#include "SerialCommunicator.hpp"
 #include "UDPCommunicator.hpp"
 #include "local_secrets.hpp"
 #include <Arduino.h>
@@ -29,12 +28,20 @@
 #define CH_FWD2 2
 #define CH_REV2 3
 
-#define STEP_DELAY_MS 10
+#define STEP_DELAY_MS 2 
 
 #define COMPLEMENTARY_ALPHA 0.1
 
 #define DEFAULT_DESIRED_PITCH 0
 
+#define DEFAULT_P 1
+#define DEFAULT_I 1
+#define DEFAULT_D 1
+#define DEFAULT_LIMIT_P 10
+#define DEFAULT_LIMIT_I 10
+#define DEFAULT_LIMIT_D 10
+
+#define ALPHA 0.05f   // accel trust: raise if gyro drifts, lower if accel is noisy
 
 
 static const uint16_t LISTEN_PORT = 5005;
@@ -42,7 +49,7 @@ MPU6050 mpu;
 
 
 // SerialCommunicator SC;
-UdpCommunicator comm(WIFI_SSID, WIFI_PASS, LISTEN_PORT);
+UdpCommunicator comm(WIFI_SSID, WIFI_PASS, LISTEN_PORT, DEFAULT_P, DEFAULT_I, DEFAULT_D, DEFAULT_DESIRED_PITCH, DEFAULT_LIMIT_P, DEFAULT_LIMIT_I, DEFAULT_LIMIT_D);
 
 void setup() {
 	Serial.begin(115200);
@@ -89,197 +96,150 @@ void setup() {
 	ledcWrite(CH_REV2, 0);
 
 	bool wifi_ok = comm.begin();
-	// Serial.println(wifi_ok ? "WiFi connected" : "WiFi NOT connected");
+	/// Serial.println(wifi_ok ? "WiFi connected" : "WiFi NOT connected");
 }
 
-void set_speed(uint8_t speed, int ch1, int ch2, bool reverse) {
-	if (speed > PWM_MAX / 2 ) {
-		if (reverse) {
-			ledcWrite(ch1, 0);
-			ledcWrite(ch2, (speed - PWM_MAX / 2) * 2);
-		}
-		else {
-			ledcWrite(ch1, (speed - PWM_MAX / 2) * 2);
-			ledcWrite(ch2, 0);
-		}
+int scale_speed(int speed)
+{
+	float extra = 110;
+	float factor = (255 - extra) / 256;
+	int res =0;
+	if (speed < -2)
+	{
+		res = static_cast<int>(-extra + static_cast<float> (speed) * factor);
 	}
-	else {
-		if (reverse) {
-			ledcWrite(ch1, (PWM_MAX / 2 - speed) * 2);
-			ledcWrite(ch2, 0);
-		}
-		else {
-			ledcWrite(ch1, 0);
-			ledcWrite(ch2, (PWM_MAX / 2 - speed) * 2);
-		}
+	else if (speed > 2)
+	{
+		res = static_cast<int>(extra + static_cast<float> (speed) * factor);
 	}
+	// Serial.println(res);
+	return res;
 }
 
-uint8_t left_speed = 128;
-uint8_t right_speed = 128;
+void set_speed(int speed, int ch1, int ch2, bool reverse) {
+	// speed = scale_speed(speed);
+	speed = scale_speed(speed);
+	if ((speed < 0) ^ reverse)
+	{
+		ledcWrite(ch1, 0);
+		ledcWrite(ch2, _abs(speed));
+	}
+	else
+	{
+		ledcWrite(ch1, speed);
+		ledcWrite(ch2, 0);
+	}
+	// if (speed > PWM_MAX / 2 ) {
+	// 	if (reverse) {
+	// 		ledcWrite(ch1, 0);
+	// 		ledcWrite(ch2, (speed - PWM_MAX / 2) * 2);
+	// 	}
+	// 	else {
+	// 		ledcWrite(ch1, (speed - PWM_MAX / 2) * 2);
+	// 		ledcWrite(ch2, 0);
+	// 	}
+	// }
+	// else {
+	// 	if (reverse) {
+	// 		ledcWrite(ch1, (PWM_MAX / 2 - speed) * 2);
+	// 		ledcWrite(ch2, 0);
+	// 	}
+	// 	else {
+	// 		ledcWrite(ch1, 0);
+	// 		ledcWrite(ch2, (PWM_MAX / 2 - speed) * 2);
+	// 	}
+	// }
+}
+
+float left_speed = 0;
+float right_speed = 0;
 
 
-float tilt = 0.0f;
-float dt   = 0.02f;
-
-#define ALPHA 0.02f   // accel trust: raise if gyro drifts, lower if accel is noisy
+float tilt = DEFAULT_DESIRED_PITCH;
+float dt = STEP_DELAY_MS / 1000.f;
+float p, i, d, desired_pitch, p_limit, i_limit, d_limit;
+float prev_offset = 0;
+float integral = 0;
 
 void loop() {
 	int16_t ax, ay, az, gx, gy, gz;
 	mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-
 	float ax_g = ax / 16384.0f;
 	float ay_g = ay / 16384.0f;
 	float az_g = az / 16384.0f;
 
-	// ---- Accel tilt: atan2 of the two axes NOT aligned with gravity ----
-	// When balanced, one axis reads ~1g — that's your "up" axis.
-	// The tilt is the angle away from that.
-	//
-	// MPU flat (Z up):        accel_tilt = atan2(ax_g, az_g)
-	// MPU rotated, Y up:      accel_tilt = atan2(ax_g, ay_g)
-	// MPU rotated, X up:      accel_tilt = atan2(ay_g, ax_g)
-	//
-	// Just power on the robot BALANCED and Serial.print ax_g, ay_g, az_g
-	// — whichever reads ~1.0 is your up-axis. Put it as the SECOND arg below.
+	float accel_tilt = atan2f(az_g, -ax_g) * 180.0f / PI;
+	float gyro_rate = gx / 131.0f;
 
-	float accel_tilt = atan2f(az_g, ax_g) * 180.0f / PI;  // <-- adjust axes here
-
-	// Gyro rate on the tilt axis (matching axis, in deg/s)
-	float gyro_rate = gy / 131.0f;   // <-- adjust axis here (gx, gy, or gz)
-
-	// Complementary filter
 	tilt = (1.0f - ALPHA) * (tilt + gyro_rate * dt)
 		 +         ALPHA  *  accel_tilt;
 
-	Serial.print("Tilt: ");
-	Serial.println(tilt);
-
-	delay((int)(dt * 1000));
+	// Serial.print("Tilt: ");
+	// Serial.println(tilt);
 
 	comm.read();
-	// if (comm.data_updated()) {
-		left_speed = comm.get_left();
-		right_speed = comm.get_right();
 
-	// }
-	return ;
-	if (tilt - DEFAULT_DESIRED_PITCH > 10) {
-		left_speed += 100;
-		right_speed += 100;
-	}
-	else if (tilt - DEFAULT_DESIRED_PITCH < -10) {
-		left_speed -= 100;
-		right_speed -= 100;
-	}
-	set_speed(left_speed, CH_FWD, CH_REV, reverse_left);
-	set_speed(right_speed, CH_FWD2, CH_REV2, reverse_right);
 
-	delay(20); // maintain loop timing
+	p = comm.get_pid_p();
+	i = comm.get_pid_i();
+	d = comm.get_pid_d();
+	desired_pitch = comm.get_desired_angle();
+	p_limit = comm.get_limit_p();
+	i_limit = comm.get_limit_i();
+	d_limit = comm.get_limit_d();
+
+	float current_offset = tilt - desired_pitch;
+	if (_abs(current_offset) > 30)
+	{
+		current_offset = 0;
+		integral = 0;
+	}
+//	Serial.println(accel_tilt);
+	// Accumulate and clamp integral
+	integral += current_offset;
+	if (i != 0)
+		integral = constrain(integral, -_abs(i_limit / i), _abs(i_limit / i));  // clamp before multiply
+
+	float term_p = p * current_offset;
+	float term_i = i * integral;
+	float term_d;
+	if (_abs(current_offset - prev_offset) < 3)
+		term_d = 0;
+	else
+		term_d = d * (current_offset - prev_offset);
+
+	// Clamp each term independently
+	term_p = constrain(term_p, -p_limit, p_limit);
+	term_i = constrain(term_i, -i_limit, i_limit);
+	term_d = constrain(term_d, -d_limit, d_limit);
+
+	float speed = term_p + term_i + term_d;
+
+	prev_offset = current_offset;
+
+	left_speed  = speed;
+	right_speed = speed;
+	left_speed = constrain(left_speed, -190, 190);
+	right_speed = constrain(right_speed, -190, 190);
+	// Serial.println(left_speed);
+	// Serial.println(right_speed);
+	// Serial.println();
+	set_speed(static_cast<int>(left_speed),  CH_FWD,  CH_REV,  reverse_left);
+	set_speed(static_cast<int>(right_speed), CH_FWD2, CH_REV2, reverse_right);
+	if (comm.data_updated())
+	{
+		Serial.println("Communicator updated");
+		Serial.println(p);
+		Serial.println(i);
+		Serial.println(d);
+		Serial.println(desired_pitch);
+		Serial.println(p_limit);
+		Serial.println(i_limit);
+		Serial.println(d_limit);
+		Serial.println(term_p);
+		Serial.println(term_i);
+		Serial.println(term_d);
+		Serial.println(tilt);
+	}
+	delay(STEP_DELAY_MS);
 }
-//
-//
-// #include "MPU6050.h"
-// #include <Wire.h>
-// #include <Arduino.h>
-//
-// MPU6050 mpu;
-//
-//
-// void setup(void) {
-// 	Serial.begin(115200);
-// 	delay(1000);
-// 	Serial.println("Adafruit MPU6050 test! 1");
-//
-// 	Wire.begin(); // SDA, SCL for ESP32-C3
-// 	delay(200);
-// 	Wire.setClock(400000); // fast I2C for better reliability
-// 	delay(200);
-// 	mpu.initialize();
-// 		uint8_t error, address;
-// 		int nDevices = 0;
-//
-// 	for (address = 1; address < 127; address++) {
-// 		Wire.beginTransmission(address);
-// 		error = Wire.endTransmission();
-//
-// 		if (error == 0) {
-// 			Serial.print("Found device at 0x");
-// 			if (address < 16) Serial.print("0");
-// 			Serial.println(address, HEX);
-// 			nDevices++;
-// 		} else if (error == 4) {
-// 			Serial.print("Unknown error at 0x");
-// 			if (address < 16) Serial.print("0");
-// 			Serial.println(address, HEX);
-// 		}
-// 	}
-//
-//
-// }
-//
-// void loop() {
-// 	Serial.println("MPU6050 test!");
-// 	if (mpu.testConnection()) {
-// 		Serial.println("MPU6050 connection successful!");
-// 	}
-// 		int16_t ax, ay, az, gx, gy, gz;
-// 		mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-// 		float pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
-// 		float roll = atan2(-ay, az) * 180.0 / PI;
-// 		Serial.println(pitch);
-//
-// 	delay(500);
-// }
-
-
-// #include <Arduino.h>
-// #include <Wire.h>
-//
-// #define SDA_PIN 6
-// #define SCL_PIN 7
-//
-// void setup() {
-// 	Serial.begin(115200);
-// 	delay(1000);
-//
-// 	Wire.begin(SDA_PIN, SCL_PIN);
-//
-// 	Serial.println("I2C Scanner");
-// }
-//
-// void loop() {
-// 	uint8_t error, address;
-// 	int nDevices = 0;
-//
-// 	Serial.println("Scanning...");
-//
-// 	for (address = 1; address < 127; address++) {
-// 		Wire.beginTransmission(address);
-// 		error = Wire.endTransmission();
-//
-// 		if (error == 0) {
-// 			Serial.print("Found device at 0x");
-// 			if (address < 16) Serial.print("0");
-// 			Serial.println(address, HEX);
-// 			nDevices++;
-// 		}
-// 		else if (error == 4) {
-// 			Serial.print("Unknown error at 0x");
-// 			if (address < 16) Serial.print("0");
-// 			Serial.println(address, HEX);
-// 		}
-// 	}
-//
-// 	if (nDevices == 0) {
-// 		Serial.println("No I2C devices found\n");
-// 	} else {
-// 		Serial.println("Done\n");
-// 	}
-//
-// 	delay(2000);
-// }
-//
-
-
-

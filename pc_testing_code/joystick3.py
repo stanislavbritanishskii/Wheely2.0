@@ -2,6 +2,7 @@
 import sys
 import socket
 import pygame
+import pygame.font
 import math
 
 # Configuration
